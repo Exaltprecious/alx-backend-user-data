@@ -1,121 +1,115 @@
 #!/usr/bin/env python3
-"""A module for authentication-related routines.
+"""DB module
 """
-import bcrypt
-from uuid import uuid4
-from typing import Union
+import logging
+from typing import Dict
+
+from sqlalchemy import create_engine
+from sqlalchemy.exc import InvalidRequestError
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker
 from sqlalchemy.orm.exc import NoResultFound
+from sqlalchemy.orm.session import Session
 
-from db import DB
-from user import User
+from user import Base, User
 
-
-def _hash_password(password: str) -> bytes:
-    """Hashes a password.
-    """
-    return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt())
+logging.disable(logging.WARNING)
 
 
-def _generate_uuid() -> str:
-    """Generates a UUID.
-    """
-    return str(uuid4())
-
-
-class Auth:
-    """Auth class to interact with the authentication database.
+class DB:
+    """DB class
     """
 
-    def __init__(self):
-        """Initializes a new Auth instance.
+    def __init__(self) -> None:
+        """Initialize a new DB instance
         """
-        self._db = DB()
+        self._engine = create_engine("sqlite:///a.db", echo=True)
+        Base.metadata.drop_all(self._engine)
+        Base.metadata.create_all(self._engine)
+        self.__session = None
 
-    def register_user(self, email: str, password: str) -> User:
-        """Adds a new user to the database.
+    @property
+    def _session(self) -> Session:
+        """Memoized session object
         """
+        if self.__session is None:
+            DBSession = sessionmaker(bind=self._engine)
+            self.__session = DBSession()
+        return self.__session
+
+    def add_user(self, email: str, hashed_password: str) -> User:
+        """Adds a new user to the db with the given email and hashed password.
+
+        Args:
+            email (str): The email address of the new user.
+            hashed_password (str): The hashed password of the new user.
+
+        Returns:
+            User: A User object representing the new user.
+        """
+        # Create new user
+        new_user = User(email=email, hashed_password=hashed_password)
         try:
-            self._db.find_user_by(email=email)
+            self._session.add(new_user)
+            self._session.commit()
+        except Exception as e:
+            print(f"Error adding user to database: {e}")
+            self._session.rollback()
+            raise
+        return new_user
+
+    def find_user_by(self, **kwargs: Dict[str, str]) -> User:
+        """Find a user by specified attributes.
+
+        Raises:
+            error: NoResultFound: When no results are found.
+            error: InvalidRequestError: When invalid query arguments are passed
+
+        Returns:
+            User: First row found in the `users` table.
+        """
+        session = self._session
+        try:
+            user = session.query(User).filter_by(**kwargs).one()
         except NoResultFound:
-            return self._db.add_user(email, _hash_password(password))
-        raise ValueError("User {} already exists".format(email))
-
-    def valid_login(self, email: str, password: str) -> bool:
-        """Checks if a user's login details are valid.
-        """
-        user = None
-        try:
-            user = self._db.find_user_by(email=email)
-            if user is not None:
-                return bcrypt.checkpw(
-                    password.encode("utf-8"),
-                    user.hashed_password,
-                )
-                except NoResultFound:
-            return False
-        return False
-
-    def create_session(self, email: str) -> str:
-        """Creates a new session for a user.
-        """
-        user = None
-        try:
-            user = self._db.find_user_by(email=email)
-        except NoResultFound:
-            return None
-        if user is None:
-            return None
-        session_id = _generate_uuid()
-        self._db.update_user(user.id, session_id=session_id)
-        return session_id
-
-    def get_user_from_session_id(self, session_id: str) -> Union[User, None]:
-        """Retrieves a user based on a given session ID.
-        """
-        user = None
-        if session_id is None:
-            return None
-        try:
-            user = self._db.find_user_by(session_id=session_id)
-        except NoResultFound:
-            return None
+            raise NoResultFound()
+        except InvalidRequestError:
+            raise InvalidRequestError()
+        # print("Type of user: {}".format(type(user)))
         return user
 
-    def destroy_session(self, user_id: int) -> None:
-        """Destroys a session associated with a given user.
-        """
-        if user_id is None:
-            return None
-        self._db.update_user(user_id, session_id=None)
+    def update_user(self, user_id: int, **kwargs) -> None:
+        """Updates a user's attributes by user ID and arbitrary keyword
+        arguments.
 
-    def get_reset_password_token(self, email: str) -> str:
-        """Generates a password reset token for a user.
+        Args:
+            user_id (int): The ID of the user to update.
+            **kwargs: Keyword arguments representing the user's attributes to
+            update.
+
+        Raises:
+            ValueError: If an invalid attribute is passed in kwargs.
+
+        Returns:
+            None
         """
-        user = None
         try:
-            user = self._db.find_user_by(email=email)
+            # Find the user with the given user ID
+            user = self.find_user_by(id=user_id)
         except NoResultFound:
-            user = None
-        if user is None:
-            raise ValueError()
-        reset_token = _generate_uuid()
-        self._db.update_user(user.id, reset_token=reset_token)
-        return reset_token
+            raise ValueError("User with id {} not found".format(user_id))
 
-    def update_password(self, reset_token: str, password: str) -> None:
-        """Updates a user's password given the user's reset token.
+        # Update user's attributes
+        for key, value in kwargs.items():
+            if not hasattr(user, key):
+                # Raise error if an argument that does not correspond to a user
+                # attribute is passed
+                raise ValueError("User has no attribute {}".format(key))
+            setattr(user, key, value)
 
-        """
-        user = None
         try:
-            user = self._db.find_user_by(reset_token=reset_token)
-        except NoResultFound:
-            user = None
-            if user is None:
-            raise ValueError()
-        new_password_hash = _hash_password(password)
-        self._db.update_user(
-            user.id,
-            hashed_password=new_password_hash,
-            reset_token=None,
-        )
+            # Commit changes to the database
+            self._session.commit()
+        except InvalidRequestError:
+            # Raise error if an invalid request is made
+            raise ValueError("Invalid request")
